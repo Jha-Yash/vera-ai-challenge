@@ -190,9 +190,19 @@ def compose(trigger: Dict[str, Any], merchant: Dict[str, Any], category: Dict[st
         baseline = p.get("vs_baseline")
         peer = category.get("peer_stats", {}).get(f"avg_{metric}")
         comparison = f" Peer benchmark is {peer}." if peer is not None else ""
-        body = f"{prefix}{metric} are {delta} over {p.get('window','the recent window')} (baseline {baseline}).{comparison} Rather than guessing, I can draft one focused change tied to this dip and your current offer. Want me to?"
-        return body, "open_ended", "Performance trigger is acknowledged with the supplied delta/window/baseline and a concrete next step."
 
+        offer = active_offer(merchant)
+        offer_text = offer.get("title") if offer else "your current offer"
+
+        body = (
+            f"{prefix}{metric} are {delta} over {p.get('window','the recent window')} "
+            f"(baseline {baseline}).{comparison} "
+            f"You already have {offer_text} active. "
+            f"Want me to draft one focused profile change around that offer?"
+        )
+
+        return body, "open_ended", "Performance trigger is acknowledged with the supplied delta/window/baseline and a concrete next step."
+    
     if kind == "renewal_due":
         plan = p.get("plan", "current plan")
         amount = p.get("renewal_amount")
@@ -351,7 +361,11 @@ async def tick(body: TickBody):
         if not category:
             continue
         customer = get("customer", customer_id) if customer_id else None
-        suppression = trigger.get("suppression_key") or trg_id
+        # Suppress only the same trigger version. If Magicpin sends an updated
+        # version of an existing trigger, allow the bot to reconsider it.
+        trigger_record = contexts.get(("trigger", trg_id), {})
+        trigger_version = trigger_record.get("version", 1)
+        suppression = f"{trigger.get('suppression_key') or trg_id}:v{trigger_version}"
         if suppression in sent_suppressions:
             continue
         body_text, cta, rationale = compose(trigger, merchant, category, customer)
@@ -415,11 +429,65 @@ async def reply(body: ReplyBody):
         conv["last_body"] = body_text
         return {"action": "send", "body": body_text, "cta": "open_ended", "rationale": "Accepted the merchant/customer intent and moved directly to the promised next artifact without re-qualifying."}
 
-    # Handle a useful question without hallucinating new facts.
+    # Handle useful questions using the facts already stored for this conversation.
     if "?" in msg or re.search(r"\b(what|how|which|when|where|price|cost|details)\b", msg.lower()):
-        last = conv.get("last_body", "")
-        body_text = f"Good question. I’ll stick to the details already provided for this {trigger.get('kind','conversation').replace('_',' ')} and avoid making up anything not in your data. If you tell me which part you want to act on first, I’ll draft that piece."
-        return {"action": "send", "body": body_text, "cta": "open_ended", "rationale": "Answers cautiously from available context and asks for one concrete next step rather than fabricating details."}
+        kind = trigger.get("kind", "conversation")
+        p = trigger.get("payload", {}) or {}
+
+        if kind == "perf_dip":
+            metric = p.get("metric", "the metric")
+            delta = fmt_pct(p.get("delta_pct"))
+            window = p.get("window", "the recent window")
+            baseline = p.get("vs_baseline")
+            peer = category.get("peer_stats", {}).get(f"avg_{metric}")
+            peer_text = f" The supplied peer benchmark is {peer}." if peer is not None else ""
+            baseline_text = f" against a baseline of {baseline}" if baseline is not None else ""
+            body_text = (
+                f"The signal we have is {metric} at {delta} over {window}{baseline_text}.{peer_text} "
+                f"I'd start with one focused change tied to that metric rather than changing several things at once. "
+                f"Want me to draft that change?"
+            )
+        elif kind == "research_digest":
+            item = category_digest_item(category, p.get("top_item_id")) or {}
+            title = item.get("title", "the supplied research item")
+            source = item.get("source")
+            source_text = f" The supplied source is {source}." if source else ""
+            body_text = (
+                f"The item I was referring to is “{title}”.{source_text} "
+                f"I can turn its supplied takeaway into a short, ready-to-use customer message. Want me to draft it?"
+            )
+        elif kind == "festival_upcoming":
+            date = p.get("date", "the supplied date")
+            days = p.get("days_until")
+            days_text = f" ({days} days away)" if days is not None else ""
+            body_text = (
+                f"The trigger is tied to {p.get('festival', 'the upcoming festival')} on {date}{days_text}. "
+                f"For {category.get('slug', merchant.get('category_slug', 'your category'))}, "
+                f"I can adapt your existing offer into one simple festival message. Want the draft?"
+            )
+        elif kind == "renewal_due":
+            plan = p.get("plan", "current plan")
+            days = p.get("days_remaining")
+            amount = p.get("renewal_amount")
+            amount_text = f" at ₹{amount:,}" if isinstance(amount, (int, float)) else ""
+            body_text = (
+                f"Your supplied renewal detail is the {plan} plan, {days} days remaining{amount_text}. "
+                f"I can compare that against the performance context already provided before you decide. Want that summary?"
+            )
+        else:
+            body_text = (
+                f"The current conversation is about {kind.replace('_', ' ')}. "
+                f"I'll use only the merchant, category, customer, and trigger facts already supplied. "
+                f"Tell me the one part you want to act on first, and I'll draft that next."
+            )
+
+        conv["last_body"] = body_text
+        return {
+            "action": "send",
+            "body": body_text,
+            "cta": "open_ended",
+            "rationale": "Answered from the stored trigger/context facts and proposed one concrete next step without inventing new facts."
+        }
 
     return {"action": "wait", "wait_seconds": 900, "rationale": "No clear action intent in the reply; pausing briefly instead of over-messaging."}
 
